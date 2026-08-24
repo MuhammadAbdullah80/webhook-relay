@@ -4,13 +4,20 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 )
+
+// shutdownGrace bounds how long a permanently dead target may hold up exit.
+const shutdownGrace = 20 * time.Second
 
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
@@ -36,14 +43,36 @@ func main() {
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	log.Printf("webhook-relay listening on %s, fanning out to %d target(s)", *addr, len(targets))
 	srv := &http.Server{
 		Addr:              *addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("webhook-relay: %v", err)
+
+	// Stop accepting on SIGINT/SIGTERM, then drain: the listener closes first so
+	// no new payloads arrive, and the deferred relay.Shutdown flushes whatever is
+	// still queued before the process exits.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	errCh := make(chan error, 1)
+	go func() {
+		log.Printf("webhook-relay listening on %s, fanning out to %d target(s)", *addr, len(targets))
+		errCh <- srv.ListenAndServe()
+	}()
+
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("webhook-relay: %v", err)
+		}
+	case <-ctx.Done():
+		log.Print("webhook-relay: signal received, draining")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("webhook-relay: listener did not close cleanly: %v", err)
+		}
 	}
 }
 
