@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -17,9 +18,10 @@ const maxBody = 1 << 20 // 1 MiB
 // owns an independent buffered queue, so one unhealthy downstream applies
 // backpressure only to itself.
 type Relay struct {
-	client *http.Client
-	queues []chan []byte
-	wg     sync.WaitGroup
+	client  *http.Client
+	targets []string
+	queues  []chan []byte
+	wg      sync.WaitGroup
 }
 
 // NewRelay starts `workers` delivery goroutines for each target URL.
@@ -27,7 +29,7 @@ func NewRelay(targets []string, workers int, client *http.Client) *Relay {
 	if workers < 1 {
 		workers = 1
 	}
-	r := &Relay{client: client, queues: make([]chan []byte, len(targets))}
+	r := &Relay{client: client, targets: targets, queues: make([]chan []byte, len(targets))}
 	for i, target := range targets {
 		q := make(chan []byte, 256)
 		r.queues[i] = q
@@ -57,16 +59,18 @@ func (r *Relay) Handle(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
 		return
 	}
-	dropped := 0
-	for _, q := range r.queues {
+	var shed []string
+	for i, q := range r.queues {
 		select {
 		case q <- body:
 		default:
-			dropped++ // queue full: shed rather than block the listener
+			// Queue full: shed rather than block the listener, and record which
+			// target it was so the log names something actionable.
+			shed = append(shed, r.targets[i])
 		}
 	}
-	if dropped > 0 {
-		log.Printf("relay: shed payload for %d saturated target(s)", dropped)
+	if len(shed) > 0 {
+		log.Printf("relay: shed payload for saturated target(s): %s", strings.Join(shed, ", "))
 	}
 	w.WriteHeader(http.StatusAccepted)
 }
